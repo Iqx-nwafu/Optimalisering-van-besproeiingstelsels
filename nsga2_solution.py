@@ -1,59 +1,18 @@
 """
 NSGA‑II algorithm for multi‑objective irrigation grouping optimisation.
 
-This script provides a pure Python/NumPy implementation of the Non‑Dominated
-Sorting Genetic Algorithm II (NSGA‑II) to solve the irrigation grouping
-problem.  NSGA‑II is a popular evolutionary algorithm for multi‑objective
-optimisation that combines fast non‑dominated sorting with a crowding
-distance measure to maintain a diverse set of Pareto‑optimal solutions【246753596889157†L171-L189】.
+This patched variant removes unsupported hyper‑parameter arguments when
+instantiating ``IrrigationGroupingEnv``.  Some versions of the
+environment constructor do not accept keyword arguments such as
+``beta_infeasible``, ``alpha_var_final`` or ``lambda_branch_soft``.  Passing
+them will raise a ``TypeError`` complaining about unexpected keyword
+arguments.  To ensure compatibility across different environment
+implementations, the ``build_environment`` function in this file only
+provides the parameters that are guaranteed to be recognised (evaluator,
+lateral IDs, lateral mapping, optional single margin map and seed).
 
-The algorithm is described as follows【246753596889157†L171-L189】:
-
-1. **Initialisation** – generate an initial population of candidate solutions (here,
-   random permutations of all laterals) and evaluate their objective values.
-2. **Non‑dominated sorting** – rank individuals into fronts based on Pareto
-   dominance.  Individuals in the first front are non‑dominated, those in the
-   second front are dominated only by individuals in the first front, and so
-   on.  A crowding distance is computed within each front to encourage
-   diversity【246753596889157†L171-L189】.
-3. **Selection** – use binary tournament selection based on rank and crowding
-   distance to choose parents.
-4. **Crossover and mutation** – produce offspring via order crossover and
-   swap mutation.  Crossover exchanges segments between two parent
-   permutations while preserving the sequence property; mutation swaps two
-   positions in a permutation.
-5. **Environmental selection** – combine parent and offspring populations,
-   perform non‑dominated sorting and crowding distance computation again,
-   and select the best individuals to form the next generation.
-
-The objectives for the irrigation grouping problem are:
-
-* Minimise the variance of the minimum hydraulic margins (s_g) across groups.
-* Maximise the minimum margin across the entire episode (implemented by
-  minimising its negative).
-
-Each candidate solution is represented as a permutation of the lateral
-indices.  Evaluation is performed using the ``evaluate_permutation``
-function defined below.  You must provide an environment instance
-(``IrrigationGroupingEnv``) configured with your hydraulic network.
-
-Usage
------
-1. Make sure ``tree_evaluator.py`` and ``ppo_env.py`` are available and that
-   ``Nodes.xlsx`` and ``Pipes.xlsx`` reside in the working directory.
-2. Adjust the population size, number of generations, crossover and mutation
-   rates in the ``main`` function to suit your problem size and time budget.
-3. Run this script.  The final Pareto front is printed along with objective
-   values.
-
-Note
-----
-This implementation is intended for experimentation and educational purposes.
-For large populations or many generations it may be slow because it is
-implemented purely in Python.  Libraries such as ``pymoo`` provide
-optimised implementations of NSGA‑II, but may not be available in all
-environments.  Nevertheless, the algorithm here follows the same steps as
-described in the literature【246753596889157†L171-L189】.
+The rest of the NSGA‑II implementation is unchanged and follows the
+standard approach described in the literature.
 """
 
 from __future__ import annotations
@@ -279,7 +238,24 @@ def build_environment(seed: int = 0) -> IrrigationGroupingEnv:
 
     This function loads the network from Excel files, constructs the lateral
     mapping and single margin dictionary, and returns an ``IrrigationGroupingEnv``
-    instance.  Adjust hyperparameters here to match your PPO setup if needed.
+    instance.
+
+    The original implementation passed hyper‑parameters such as
+    ``beta_infeasible``, ``alpha_var_final`` and ``lambda_branch_soft`` to the
+    environment constructor.  If the environment class does not accept these
+    keyword arguments, a ``TypeError`` will be raised.  This patched
+    implementation omits those arguments and relies on the defaults provided by
+    the environment class.
+
+    Parameters
+    ----------
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    IrrigationGroupingEnv
+        Configured environment ready for sampling and evaluation.
     """
     nodes = load_nodes_xlsx("Nodes.xlsx")
     edges = load_pipes_xlsx("Pipes.xlsx")
@@ -295,9 +271,6 @@ def build_environment(seed: int = 0) -> IrrigationGroupingEnv:
         lateral_ids=lateral_ids,
         lateral_to_node=lateral_to_node,
         single_margin_map=single_margin_map,
-        beta_infeasible=1e4,
-        alpha_var_final=0.0,
-        lambda_branch_soft=0.1,
         seed=seed,
     )
     return env
