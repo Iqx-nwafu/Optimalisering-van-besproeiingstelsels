@@ -16,23 +16,17 @@ environment class.
 from __future__ import annotations
 
 import numpy as np
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 
 try:
     # Import the evaluation environment from the existing project.  If this
     # fails because ``tree_evaluator.py`` is unavailable, please ensure that
     # module is installed on your PYTHONPATH.
     from ppo_env import IrrigationGroupingEnv
-    from tree_evaluator import (
-        TreeHydraulicEvaluator,
-        load_nodes_xlsx,
-        load_pipes_xlsx,
-        build_lateral_ids_for_field_nodes,
-        is_field_node_id,
-    )
+    from comparison_utils import ComparisonConfig, build_environment as build_shared_env, composite_score, evaluate_order
 except ImportError as e:
     raise ImportError(
-        "Required modules not found. Make sure `ppo_env.py` and `tree_evaluator.py` "
+        "Required modules not found. Make sure `ppo_env.py` and `comparison_utils.py` "
         "are accessible in the PYTHONPATH."
     ) from e
 
@@ -165,28 +159,15 @@ def evaluate_permutation(env: IrrigationGroupingEnv, order: np.ndarray) -> Tuple
         achieved during the episode (so that both objectives are minimised in
         optimisation).
     """
-    obs, _ = env.reset()
-    done = False
-    final_var = None
-    min_margin_neg = None
-    for act in order:
-        obs, reward, done, truncated, info = env.step(int(act))
-        if done:
-            # At termination the info dict contains final statistics
-            final_var = info.get("final_var", info.get("running_var"))
-            min_margin_neg = -info.get("min_s_over_episode", 0.0)
-            break
-    if final_var is None:
-        # Episode finished without hard violation
-        final_var = info.get("final_var", info.get("running_var"))
-        min_margin_neg = -info.get("min_s_over_episode", 0.0)
-    return float(final_var), float(min_margin_neg)
+    metrics = evaluate_order(env, order.tolist())
+    return metrics["final_var"], -metrics["min_margin"]
 
 
 def generate_training_data(
     env: IrrigationGroupingEnv,
-    num_samples: int = 200,
-    top_k: int = 10,
+    num_samples: int = 600,
+    top_k: int = 30,
+    margin_weight: float = 1.0,
     seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate training data by sampling random schedules.
@@ -206,6 +187,8 @@ def generate_training_data(
     top_k : int
         Number of best permutations (lowest composite objective) to use for
         training.
+    margin_weight : float
+        Weight applied to the minimum-margin term in the composite score.
     seed : Optional[int]
         Random seed for reproducibility.
 
@@ -226,7 +209,7 @@ def generate_training_data(
         perm = rng.permutation(N)
         var, neg_min = evaluate_permutation(env, perm)
         # Composite objective: prioritise low variance and high min margin
-        obj = var + neg_min
+        obj = composite_score(var, -neg_min, margin_weight=margin_weight)
         samples.append((perm, (var, neg_min, obj)))
     # Sort by composite objective (lower is better)
     samples.sort(key=lambda x: x[1][2])
@@ -245,58 +228,19 @@ def generate_training_data(
     return X_train, y_train
 
 
-def build_environment(seed: int = 0) -> IrrigationGroupingEnv:
-    """Instantiate the irrigation grouping environment with real network data.
-
-    Loads the nodes and pipes Excel files using ``tree_evaluator.py``, builds
-    the lateral list and mapping, computes single lateral margins, and creates
-    an ``IrrigationGroupingEnv`` instance.
-
-    The original version of this function passed hyper‑parameters such as
-    ``beta_infeasible``, ``alpha_var_final`` and ``lambda_branch_soft`` to the
-    environment constructor.  In some versions of ``IrrigationGroupingEnv``
-    these arguments are not recognised, causing a ``TypeError``.  This
-    implementation omits those arguments and instead relies on the default
-    values defined in the environment class.
-
-    Parameters
-    ----------
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    IrrigationGroupingEnv
-        Configured environment ready for sampling and evaluation.
-    """
-    nodes = load_nodes_xlsx("Nodes.xlsx")
-    edges = load_pipes_xlsx("Pipes.xlsx")
-    evaluator = TreeHydraulicEvaluator(nodes=nodes, edges=edges, root="J0", H0=25.0, Hmin=11.59)
-    field_nodes = [nid for nid in nodes.keys() if is_field_node_id(nid)]
-    lateral_ids, lateral_to_node = build_lateral_ids_for_field_nodes(field_nodes)
-    # Optionally compute single lateral margins
-    single_margin_map: Dict[str, float] = {}
-    for lid in lateral_ids:
-        r = evaluator.evaluate_group([lid], lateral_to_node=lateral_to_node, q_lateral=0.012)
-        single_margin_map[lid] = float(r.min_margin)
-    # Instantiate the environment without unsupported keyword arguments
-    env = IrrigationGroupingEnv(
-        evaluator=evaluator,
-        lateral_ids=lateral_ids,
-        lateral_to_node=lateral_to_node,
-        single_margin_map=single_margin_map,
-        seed=seed,
-    )
-    return env
+def build_environment(seed: int = 0, config: Optional[ComparisonConfig] = None) -> IrrigationGroupingEnv:
+    """Instantiate the irrigation grouping environment with shared settings."""
+    return build_shared_env(seed=seed, config=config)
 
 
 def main() -> None:
     """Run the DNN training and evaluate the resulting schedule."""
     # Build environment
-    env = build_environment(seed=0)
+    config = ComparisonConfig()
+    env = build_environment(seed=0, config=config)
     print(f"Loaded environment with {env.N} laterals and {env.F_static} static features.")
     # Generate training data
-    X_train, y_train = generate_training_data(env, num_samples=200, top_k=10, seed=0)
+    X_train, y_train = generate_training_data(env, num_samples=600, top_k=30, margin_weight=1.0, seed=0)
     print(f"Generated training dataset of {X_train.shape[0]} samples.")
     # Train neural network
     model = SimpleNN(input_dim=X_train.shape[1], hidden_dim=32, lr=1e-2, seed=0)
@@ -307,9 +251,11 @@ def main() -> None:
     predicted_order = np.argsort(scores)
     # Evaluate predicted schedule
     final_var, neg_min_margin = evaluate_permutation(env, predicted_order)
+    composite = composite_score(final_var, -neg_min_margin, margin_weight=1.0)
     print("Predicted schedule results:")
     print(f"  Final variance: {final_var:.6f}")
     print(f"  Minimum margin: {-neg_min_margin:.6f}")
+    print(f"  Composite score: {composite:.6f}")
     # Optionally, print the predicted ordering and corresponding lateral IDs
     predicted_lids = [env.lateral_ids[i] for i in predicted_order]
     print("Predicted lateral ordering:")

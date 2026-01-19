@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 
@@ -21,7 +21,8 @@ from tree_evaluator import (
     build_lateral_ids_for_field_nodes,
     is_field_node_id,
 )
-from ppo_env import IrrigationGroupingEnv, RewardWeights, RewardScales, SafetyShaping
+from comparison_utils import ComparisonConfig
+from ppo_env import IrrigationGroupingEnv
 
 
 @lru_cache(maxsize=1)
@@ -50,36 +51,35 @@ def _load_base() -> Tuple[Dict, List, List[str], Dict[str, str], Dict[str, float
 
 def _build_env(
     seed: int,
-    reward_weights: RewardWeights,
-    reward_scales: RewardScales,
-    safety_shaping: SafetyShaping,
-    include_single_margin: bool = True,
+    config: ComparisonConfig,
 ) -> IrrigationGroupingEnv:
     nodes, edges, lateral_ids, lateral_to_node, single_margin_map = _load_base()
 
     # Each env needs its own evaluator instance (safe for subprocess)
-    evaluator = TreeHydraulicEvaluator(nodes=nodes, edges=edges, root="J0", H0=25.0, Hmin=11.59)
+    evaluator = TreeHydraulicEvaluator(nodes=nodes, edges=edges, root="J0", H0=config.H0, Hmin=config.Hmin)
 
     env = IrrigationGroupingEnv(
         evaluator=evaluator,
         lateral_ids=lateral_ids,
         lateral_to_node=lateral_to_node,
+        Hmin=config.Hmin,
+        q_lateral=config.q_lateral,
 
-        include_single_margin=include_single_margin,
-        single_margin_map=(single_margin_map if include_single_margin else None),
+        include_single_margin=config.include_single_margin,
+        single_margin_map=(single_margin_map if config.include_single_margin else None),
 
         # normalized hard constraints
-        infeasible_reward=-1.0,
-        invalid_action_reward=-1.0,
+        infeasible_reward=config.infeasible_reward,
+        invalid_action_reward=config.invalid_action_reward,
 
         # soft constraint
-        lambda_branch_soft=0.05,
+        lambda_branch_soft=config.lambda_branch_soft,
 
         # reward engineering
-        reward_weights=reward_weights,
-        reward_scales=reward_scales,
-        safety_shaping=safety_shaping,
-        reward_clip=1.0,
+        reward_weights=config.reward_weights,
+        reward_scales=config.reward_scales,
+        safety_shaping=config.safety_shaping,
+        reward_clip=config.reward_clip,
 
         seed=seed,
     )
@@ -88,33 +88,41 @@ def _build_env(
 
 def make_env(
     seed: int,
-    reward_weights: RewardWeights = RewardWeights(),
-    reward_scales: RewardScales = RewardScales(),
-    safety_shaping: SafetyShaping = SafetyShaping(),
-    include_single_margin: bool = True,
+    config: Optional[ComparisonConfig] = None,
 ):
     """Single env for evaluation/debug; keep compatible with eval_one.py."""
-    env = _build_env(seed, reward_weights, reward_scales, safety_shaping, include_single_margin)
+    env = _build_env(seed, config or ComparisonConfig())
     return Monitor(env)
+
+
+def make_eval_vec_env(
+    seed: int,
+    config: Optional[ComparisonConfig] = None,
+):
+    """Evaluation VecEnv to match training env type for callbacks."""
+    config = config or ComparisonConfig()
+
+    def _init():
+        return _build_env(seed, config)
+
+    vec = DummyVecEnv([_init])
+    vec = VecMonitor(vec)
+    return vec
 
 
 def make_vec_env(
     num_envs: int,
     start_seed: int = 0,
-    reward_weights: RewardWeights = RewardWeights(),
-    reward_scales: RewardScales = RewardScales(),
-    safety_shaping: SafetyShaping = SafetyShaping(),
-    include_single_margin: bool = True,
+    config: Optional[ComparisonConfig] = None,
 ):
     """Parallel VecEnv for training."""
+    config = config or ComparisonConfig()
+
     def thunk(rank: int):
         def _init():
             return _build_env(
                 seed=start_seed + rank,
-                reward_weights=reward_weights,
-                reward_scales=reward_scales,
-                safety_shaping=safety_shaping,
-                include_single_margin=include_single_margin,
+                config=config,
             )
         return _init
 
@@ -138,41 +146,16 @@ if __name__ == "__main__":
     torch_threads = int(os.environ.get("TORCH_THREADS", "4"))
     torch.set_num_threads(torch_threads)
 
-    # ---- Reward configuration (tune these)
-    reward_weights = RewardWeights(
-        w_var_step=0.5,
-        w_mean_step=0.1,
-        w_safe_step=0.2,
-        w_var_final=0.67,
-        w_mean_final=0.33,
-        w_min_final=0.0,
-    )
-    reward_scales = RewardScales(
-        var_step=1.0,
-        mean_step=1.0,
-        var_final=1.0,
-        mean_scale=10.0,
-    )
-    safety_shaping = SafetyShaping(
-        s_safe=1.0,      # start penalizing when margin < 1m
-        mode="linear",   # or "exp"
-        tau=0.5,
-    )
+    config = ComparisonConfig()
 
     train_env = make_vec_env(
         num_envs=num_envs,
         start_seed=0,
-        reward_weights=reward_weights,
-        reward_scales=reward_scales,
-        safety_shaping=safety_shaping,
-        include_single_margin=True,
+        config=config,
     )
-    eval_env = make_env(
+    eval_env = make_eval_vec_env(
         seed=10_000,
-        reward_weights=reward_weights,
-        reward_scales=reward_scales,
-        safety_shaping=safety_shaping,
-        include_single_margin=True,
+        config=config,
     )
 
     eval_cb = MaskableEvalCallback(

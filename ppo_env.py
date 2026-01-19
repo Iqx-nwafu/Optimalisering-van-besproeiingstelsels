@@ -430,8 +430,6 @@ if __name__ == "__main__":
         lateral_ids=lateral_ids,
         lateral_to_node=lateral_to_node,
         single_margin_map=single_margin_map,
-        beta_infeasible=1e4,
-        alpha_var_final=0.0,
         lambda_branch_soft=0.1,
         seed=0,
     )

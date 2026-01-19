@@ -8,6 +8,7 @@ import numpy as np
 from sb3_contrib import MaskablePPO
 
 # 你训练时的 env 构造函数
+from comparison_utils import ComparisonConfig, composite_score
 from train_maskable_ppo import make_env  # make_env 在这里定义并返回 Monitor(env) :contentReference[oaicite:4]{index=4}
 
 
@@ -72,16 +73,20 @@ if __name__ == "__main__":
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 构造环境 + 载入模型
-    env = make_env(seed=1)
+    config = ComparisonConfig()
+    env = make_env(seed=1, config=config)
     model = MaskablePPO.load("ppo_irrigation_masked")
 
     # 先跑一条 deterministic 基线（便于对照）
     r_det, actions_det, info_det = run_episode(model, env, deterministic=True)
     print("Deterministic reward:", r_det)
-    print("final_var:", info_det.get("final_var"))
+    final_var = float(info_det.get("final_var", 0.0))
+    min_margin = float(info_det.get("min_s_over_episode", 0.0))
+    print("final_var:", final_var)
     print("final_mean_s:", info_det.get("final_mean_s"))
-    print("min_s_over_episode:", info_det.get("min_s_over_episode"))
+    print("min_s_over_episode:", min_margin)
     print("soft_sum:", info_det.get("soft_sum"))
+    print("composite_score:", composite_score(final_var, min_margin))
 
     lateral_ids = env.unwrapped.lateral_ids
 
