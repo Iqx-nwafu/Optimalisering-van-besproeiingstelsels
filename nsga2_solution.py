@@ -24,16 +24,10 @@ import numpy as np
 
 try:
     from ppo_env import IrrigationGroupingEnv
-    from tree_evaluator import (
-        TreeHydraulicEvaluator,
-        load_nodes_xlsx,
-        load_pipes_xlsx,
-        build_lateral_ids_for_field_nodes,
-        is_field_node_id,
-    )
+    from comparison_utils import ComparisonConfig, build_environment as build_shared_env, composite_score, evaluate_order
 except ImportError:
     raise ImportError(
-        "Required modules not found. Ensure `ppo_env.py` and `tree_evaluator.py` "
+        "Required modules not found. Ensure `ppo_env.py` and `comparison_utils.py` "
         "are accessible in the PYTHONPATH."
     )
 
@@ -55,19 +49,8 @@ def evaluate_permutation(env: IrrigationGroupingEnv, order: List[int]) -> Tuple[
         final variance and a smaller negative minimum margin (i.e. a larger
         minimum margin) are better.
     """
-    obs, _ = env.reset()
-    final_var = None
-    neg_min_margin = None
-    for act in order:
-        obs, reward, done, truncated, info = env.step(int(act))
-        if done:
-            final_var = info.get("final_var", info.get("running_var"))
-            neg_min_margin = -info.get("min_s_over_episode", 0.0)
-            break
-    if final_var is None:
-        final_var = info.get("final_var", info.get("running_var"))
-        neg_min_margin = -info.get("min_s_over_episode", 0.0)
-    return float(final_var), float(neg_min_margin)
+    metrics = evaluate_order(env, order)
+    return metrics["final_var"], -metrics["min_margin"]
 
 
 def dominates(f1: Tuple[float, float], f2: Tuple[float, float]) -> bool:
@@ -233,47 +216,9 @@ def swap_mutation(permutation: List[int], rng: random.Random) -> List[int]:
     return perm
 
 
-def build_environment(seed: int = 0) -> IrrigationGroupingEnv:
-    """Instantiate the irrigation grouping environment using network data.
-
-    This function loads the network from Excel files, constructs the lateral
-    mapping and single margin dictionary, and returns an ``IrrigationGroupingEnv``
-    instance.
-
-    The original implementation passed hyper‑parameters such as
-    ``beta_infeasible``, ``alpha_var_final`` and ``lambda_branch_soft`` to the
-    environment constructor.  If the environment class does not accept these
-    keyword arguments, a ``TypeError`` will be raised.  This patched
-    implementation omits those arguments and relies on the defaults provided by
-    the environment class.
-
-    Parameters
-    ----------
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    IrrigationGroupingEnv
-        Configured environment ready for sampling and evaluation.
-    """
-    nodes = load_nodes_xlsx("Nodes.xlsx")
-    edges = load_pipes_xlsx("Pipes.xlsx")
-    evaluator = TreeHydraulicEvaluator(nodes=nodes, edges=edges, root="J0", H0=25.0, Hmin=11.59)
-    field_nodes = [nid for nid in nodes.keys() if is_field_node_id(nid)]
-    lateral_ids, lateral_to_node = build_lateral_ids_for_field_nodes(field_nodes)
-    single_margin_map: Dict[str, float] = {}
-    for lid in lateral_ids:
-        r = evaluator.evaluate_group([lid], lateral_to_node=lateral_to_node, q_lateral=0.012)
-        single_margin_map[lid] = float(r.min_margin)
-    env = IrrigationGroupingEnv(
-        evaluator=evaluator,
-        lateral_ids=lateral_ids,
-        lateral_to_node=lateral_to_node,
-        single_margin_map=single_margin_map,
-        seed=seed,
-    )
-    return env
+def build_environment(seed: int = 0, config: Optional[ComparisonConfig] = None) -> IrrigationGroupingEnv:
+    """Instantiate the irrigation grouping environment with shared settings."""
+    return build_shared_env(seed=seed, config=config)
 
 
 def nsga2(
@@ -360,7 +305,8 @@ def nsga2(
 
 def main() -> None:
     """Run NSGA‑II and print the resulting Pareto front."""
-    env = build_environment(seed=0)
+    config = ComparisonConfig()
+    env = build_environment(seed=0, config=config)
     print(f"Environment loaded with {env.N} laterals.")
     pop, fits = nsga2(env, pop_size=20, generations=30, crossover_rate=0.9, mutation_rate=0.2, seed=0)
     # After evolution, identify non‑dominated solutions in the final population
@@ -374,6 +320,17 @@ def main() -> None:
         # Optionally print the schedule as lateral IDs
         lids = [env.lateral_ids[i] for i in solution]
         print(f"    Ordering: {lids}")
+
+    scored = [
+        (composite_score(fits[i][0], -fits[i][1]), i)
+        for i in range(len(pop))
+    ]
+    scored.sort(key=lambda x: x[0])
+    best_score, best_idx = scored[0]
+    print("\nBest solution by composite score (variance + margin penalty):")
+    print(f"Composite score: {best_score:.6f}")
+    print(f"Fitness: final_var={fits[best_idx][0]:.6f}, neg_min_margin={fits[best_idx][1]:.6f}")
+    print(f"Ordering: {pop[best_idx]}")
 
 
 if __name__ == "__main__":
