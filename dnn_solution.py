@@ -1,16 +1,17 @@
+# Modified DNN solution to output top K candidate schedules matching PPO's TOPK count.
+#
 """
 Deep Neural Network approach for multi‑objective irrigation grouping optimization.
 
-This patched version removes unsupported keyword arguments when instantiating
-``IrrigationGroupingEnv``.  In some environments the constructor of
-``IrrigationGroupingEnv`` does not accept parameters like ``beta_infeasible``,
-``alpha_var_final`` or ``lambda_branch_soft``.  Passing these will result in
-a ``TypeError`` complaining about unexpected keyword arguments.  To ensure
-compatibility, this version of ``build_environment`` only supplies the
-parameters that are universally supported (``evaluator``, ``lateral_ids``,
-``lateral_to_node``, ``single_margin_map`` and ``seed``).  All other
-hyper‑parameters revert to their default values defined within the
-environment class.
+This patched version adds functionality to return the same number of top candidate
+solutions as the PPO baseline.  After training the neural network on sampled
+permutations, the script now optionally evaluates a set of high‑quality
+permutations and reports the best `TOPK_RESULTS` solutions ranked by the composite
+score (variance + margin penalty).  This allows direct comparison with the PPO
+script, which outputs the top K solutions.
+
+All original functionality is preserved; the new logic is contained in the
+``main`` function and a modified return value from ``generate_training_data``.
 """
 
 from __future__ import annotations
@@ -23,7 +24,12 @@ try:
     # fails because ``tree_evaluator.py`` is unavailable, please ensure that
     # module is installed on your PYTHONPATH.
     from ppo_env import IrrigationGroupingEnv
-    from comparison_utils import ComparisonConfig, build_environment as build_shared_env, composite_score, evaluate_order
+    from comparison_utils import (
+        ComparisonConfig,
+        build_environment as build_shared_env,
+        composite_score,
+        evaluate_order,
+    )
 except ImportError as e:
     raise ImportError(
         "Required modules not found. Make sure `ppo_env.py` and `comparison_utils.py` "
@@ -40,7 +46,9 @@ class SimpleNN:
     linear output layer.  Mean squared error is used as the loss function.
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int = 32, lr: float = 1e-3, seed: Optional[int] = None) -> None:
+    def __init__(
+        self, input_dim: int, hidden_dim: int = 32, lr: float = 1e-3, seed: Optional[int] = None
+    ) -> None:
         rng = np.random.default_rng(seed)
         # Xavier/Glorot initialisation for weights
         self.W1 = rng.normal(0, np.sqrt(2.0 / (input_dim + hidden_dim)), size=(input_dim, hidden_dim))
@@ -65,12 +73,14 @@ class SimpleNN:
             Cached values for the backward pass.
         """
         z1 = X @ self.W1 + self.b1  # (N, hidden_dim)
-        a1 = np.tanh(z1)            # (N, hidden_dim)
+        a1 = np.tanh(z1)  # (N, hidden_dim)
         z2 = a1 @ self.W2 + self.b2  # (N, 1)
-        out = z2.squeeze()          # (N,)
+        out = z2.squeeze()  # (N,)
         return out, (X, z1, a1)
 
-    def backward(self, out: np.ndarray, y: np.ndarray, cache: Tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+    def backward(
+        self, out: np.ndarray, y: np.ndarray, cache: Tuple[np.ndarray, np.ndarray, np.ndarray]
+    ) -> None:
         """Backward pass computing gradients and updating the parameters.
 
         Parameters
@@ -88,20 +98,26 @@ class SimpleNN:
         dloss = (out - y) * (2.0 / N)  # (N,)
         # Gradients for the output layer
         dW2 = a1.T @ dloss.reshape(-1, 1)  # (hidden_dim, 1)
-        db2 = np.sum(dloss)               # scalar
+        db2 = np.sum(dloss)  # scalar
         # Propagate to hidden layer
         da1 = dloss.reshape(-1, 1) @ self.W2.T  # (N, hidden_dim)
-        dz1 = da1 * (1.0 - np.tanh(z1) ** 2)    # derivative of tanh
+        dz1 = da1 * (1.0 - np.tanh(z1) ** 2)  # derivative of tanh
         # Gradients for the first layer
-        dW1 = X.T @ dz1                    # (input_dim, hidden_dim)
-        db1 = np.sum(dz1, axis=0)          # (hidden_dim,)
+        dW1 = X.T @ dz1  # (input_dim, hidden_dim)
+        db1 = np.sum(dz1, axis=0)  # (hidden_dim,)
         # Update parameters
         self.W2 -= self.lr * dW2
         self.b2 -= self.lr * db2
         self.W1 -= self.lr * dW1
         self.b1 -= self.lr * db1
 
-    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 100, verbose: bool = True) -> None:
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 100,
+        verbose: bool = True,
+    ) -> None:
         """Train the network using gradient descent.
 
         Parameters
@@ -169,7 +185,8 @@ def generate_training_data(
     top_k: int = 30,
     margin_weight: float = 1.0,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_top_permutations: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Optional[List[np.ndarray]]]:
     """Generate training data by sampling random schedules.
 
     Randomly samples ``num_samples`` permutations of all laterals, evaluates each
@@ -191,6 +208,8 @@ def generate_training_data(
         Weight applied to the minimum-margin term in the composite score.
     seed : Optional[int]
         Random seed for reproducibility.
+    return_top_permutations : bool
+        Whether to return the list of top_k permutations in addition to training data.
 
     Returns
     -------
@@ -199,12 +218,14 @@ def generate_training_data(
         laterals and F is the feature dimension.
     y_train : np.ndarray
         Target positions of shape (top_k * N,), normalised to [0,1].
+    top_perms : Optional[List[np.ndarray]]
+        If return_top_permutations=True, a list of the top_k permutation arrays.
     """
     rng = np.random.default_rng(seed)
     N = env.N
     # Use the static features from the environment as the input feature matrix
     X_static = env._feat_static.copy().astype(np.float64)
-    samples: List[Tuple[np.ndarray, Tuple[float, float]]] = []
+    samples: List[Tuple[np.ndarray, Tuple[float, float, float]]] = []
     for i in range(num_samples):
         perm = rng.permutation(N)
         var, neg_min = evaluate_permutation(env, perm)
@@ -225,7 +246,10 @@ def generate_training_data(
             y_list.append(pos / float(N - 1))
     X_train = np.stack(X_list, axis=0)
     y_train = np.array(y_list, dtype=np.float64)
-    return X_train, y_train
+    if return_top_permutations:
+        perms = [perm for perm, _ in top_samples]
+        return X_train, y_train, perms
+    return X_train, y_train, None
 
 
 def build_environment(seed: int = 0, config: Optional[ComparisonConfig] = None) -> IrrigationGroupingEnv:
@@ -234,13 +258,27 @@ def build_environment(seed: int = 0, config: Optional[ComparisonConfig] = None) 
 
 
 def main() -> None:
-    """Run the DNN training and evaluate the resulting schedule."""
+    """Run the DNN training and evaluate the resulting schedule.
+
+    This entry point has been extended to output the top ``TOPK_RESULTS`` candidate
+    schedules (based on composite score) to match the number of solutions
+    produced by the PPO evaluation script.
+    """
+    # Define how many solutions to output (e.g. match PPO's TOPK)
+    TOPK_RESULTS = 30
     # Build environment
     config = ComparisonConfig()
     env = build_environment(seed=0, config=config)
     print(f"Loaded environment with {env.N} laterals and {env.F_static} static features.")
-    # Generate training data
-    X_train, y_train = generate_training_data(env, num_samples=600, top_k=30, margin_weight=1.0, seed=0)
+    # Generate training data and capture top permutations used for training
+    X_train, y_train, top_perms = generate_training_data(
+        env,
+        num_samples=600,
+        top_k=TOPK_RESULTS,
+        margin_weight=1.0,
+        seed=0,
+        return_top_permutations=True,
+    )
     print(f"Generated training dataset of {X_train.shape[0]} samples.")
     # Train neural network
     model = SimpleNN(input_dim=X_train.shape[1], hidden_dim=32, lr=1e-2, seed=0)
@@ -260,6 +298,22 @@ def main() -> None:
     predicted_lids = [env.lateral_ids[i] for i in predicted_order]
     print("Predicted lateral ordering:")
     print(predicted_lids)
+    # ----- New: Evaluate top candidate permutations and output top results -----
+    if top_perms:
+        print(f"\nTop {TOPK_RESULTS} candidate solutions by composite score:")
+        candidate_records: List[Tuple[float, float, float, List[int]]] = []
+        for perm in top_perms:
+            var, neg_min = evaluate_permutation(env, perm)
+            score = composite_score(var, -neg_min, margin_weight=1.0)
+            candidate_records.append((score, var, -neg_min, perm.tolist()))
+        candidate_records.sort(key=lambda x: x[0])
+        for rank, (score, var, min_margin, perm) in enumerate(candidate_records, start=1):
+            print(
+                f"{rank:02d}: composite_score={score:.6f}, final_var={var:.6f}, "
+                f"min_margin={min_margin:.6f}"
+            )
+            lids = [env.lateral_ids[i] for i in perm]
+            print(f"    Ordering: {lids}")
 
 
 if __name__ == "__main__":
