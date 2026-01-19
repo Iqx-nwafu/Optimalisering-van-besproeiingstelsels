@@ -1,18 +1,14 @@
+# Modified NSGA-II solution to output top K candidate solutions by composite score.
+#
 """
 NSGA‑II algorithm for multi‑objective irrigation grouping optimisation.
 
-This patched variant removes unsupported hyper‑parameter arguments when
-instantiating ``IrrigationGroupingEnv``.  Some versions of the
-environment constructor do not accept keyword arguments such as
-``beta_infeasible``, ``alpha_var_final`` or ``lambda_branch_soft``.  Passing
-them will raise a ``TypeError`` complaining about unexpected keyword
-arguments.  To ensure compatibility across different environment
-implementations, the ``build_environment`` function in this file only
-provides the parameters that are guaranteed to be recognised (evaluator,
-lateral IDs, lateral mapping, optional single margin map and seed).
-
-The rest of the NSGA‑II implementation is unchanged and follows the
-standard approach described in the literature.
+This patched variant adds a post-processing step to report the same number of
+top candidate solutions as produced by the PPO baseline.  After running the
+NSGA‑II algorithm, the final population is sorted by a composite score
+(variance + penalty on negative minimum margin), and the top ``TOPK_RESULTS``
+solutions are printed.  The original printouts of the Pareto front and best
+solution are preserved.
 """
 
 from __future__ import annotations
@@ -24,7 +20,12 @@ import numpy as np
 
 try:
     from ppo_env import IrrigationGroupingEnv
-    from comparison_utils import ComparisonConfig, build_environment as build_shared_env, composite_score, evaluate_order
+    from comparison_utils import (
+        ComparisonConfig,
+        build_environment as build_shared_env,
+        composite_score,
+        evaluate_order,
+    )
 except ImportError:
     raise ImportError(
         "Required modules not found. Ensure `ppo_env.py` and `comparison_utils.py` "
@@ -65,7 +66,7 @@ def non_dominated_sort(fitnesses: List[Tuple[float, float]]) -> List[List[int]]:
     """
     population_size = len(fitnesses)
     S = [set() for _ in range(population_size)]  # solutions dominated by i
-    n = [0] * population_size                   # number of solutions that dominate i
+    n = [0] * population_size  # number of solutions that dominate i
     fronts: List[List[int]] = []
     # Identify domination relations
     for i in range(population_size):
@@ -119,8 +120,8 @@ def crowding_distance(front: List[int], fitnesses: List[Tuple[float, float]]) ->
         obj_values = [(i, fitnesses[i][m]) for i in front]
         obj_values.sort(key=lambda x: x[1])
         # Assign infinite distance to boundary solutions
-        distance[obj_values[0][0]] = float('inf')
-        distance[obj_values[-1][0]] = float('inf')
+        distance[obj_values[0][0]] = float("inf")
+        distance[obj_values[-1][0]] = float("inf")
         # Normalisation factor to avoid division by zero
         min_val = obj_values[0][1]
         max_val = obj_values[-1][1]
@@ -139,7 +140,7 @@ def tournament_selection(
     fronts: List[List[int]],
     distances: List[Dict[int, float]],
     pop_size: int,
-    rng: random.Random
+    rng: random.Random,
 ) -> List[List[int]]:
     """Binary tournament selection based on rank and crowding distance.
 
@@ -304,7 +305,14 @@ def nsga2(
 
 
 def main() -> None:
-    """Run NSGA‑II and print the resulting Pareto front."""
+    """Run NSGA‑II and print the resulting Pareto front and top candidate solutions.
+
+    In addition to listing the Pareto‑optimal solutions, this entry point now
+    prints the top ``TOPK_RESULTS`` solutions based on the composite score,
+    ensuring the same number of outputs as the PPO baseline.
+    """
+    # Define how many solutions to output (e.g. match PPO's TOPK)
+    TOPK_RESULTS = 30
     config = ComparisonConfig()
     env = build_environment(seed=0, config=config)
     print(f"Environment loaded with {env.N} laterals.")
@@ -320,17 +328,23 @@ def main() -> None:
         # Optionally print the schedule as lateral IDs
         lids = [env.lateral_ids[i] for i in solution]
         print(f"    Ordering: {lids}")
-
-    scored = [
-        (composite_score(fits[i][0], -fits[i][1]), i)
-        for i in range(len(pop))
-    ]
+    # Composite-score ranking for top solutions
+    scored = [(composite_score(fits[i][0], -fits[i][1]), i) for i in range(len(pop))]
     scored.sort(key=lambda x: x[0])
     best_score, best_idx = scored[0]
     print("\nBest solution by composite score (variance + margin penalty):")
     print(f"Composite score: {best_score:.6f}")
     print(f"Fitness: final_var={fits[best_idx][0]:.6f}, neg_min_margin={fits[best_idx][1]:.6f}")
     print(f"Ordering: {pop[best_idx]}")
+    # New: print top K solutions based on composite score
+    print(f"\nTop {TOPK_RESULTS} candidate solutions by composite score:")
+    for rank, (score, idx) in enumerate(scored[:TOPK_RESULTS], start=1):
+        var, neg_min = fits[idx]
+        print(
+            f"{rank:02d}: composite_score={score:.6f}, final_var={var:.6f}, min_margin={-neg_min:.6f}"
+        )
+        lids = [env.lateral_ids[i] for i in pop[idx]]
+        print(f"    Ordering: {lids}")
 
 
 if __name__ == "__main__":
